@@ -25,6 +25,9 @@ const getUserById = drizzleRequest("getUserById", {
   expectedErrorTags: ["NoSuchElementError"],
   execute: (db, userId) => db.query.user.findMany({ where: { id: userId } }),
 });
+
+const user = await getUserById(userId);
+// ^ Result<User, NoSuchElementError | CommonDrizzleError>
 ```
 
 ```ts
@@ -39,6 +42,9 @@ const insertUser = drizzleRequest("insertUser", {
   expectedErrorTags: ["UniqueViolationError"],
   execute: (db, userId) => db.insert(users).values({ id: userId }).returning(),
 });
+
+const res = await insertUser(userId);
+// ^ Result<User, UniqueViolationError | CommonDrizzleError>
 ```
 
 Options:
