@@ -27,6 +27,20 @@ const getUserById = drizzleRequest("getUserById", {
 });
 ```
 
+```ts
+const UserId = z.uuid().brand("UserId");
+const User = z.object({ ...yourSchema });
+
+const insertUser = drizzleRequest("insertUser", {
+  mode: "unique",
+  transactionMode: "require",
+  Request: UserId,
+  Result: User,
+  expectedErrorTags: ["UniqueViolationError"],
+  execute: (db, userId) => db.insert(users).values({ id: userId }).returning(),
+});
+```
+
 Options:
 
 - id: string
@@ -42,7 +56,7 @@ Options:
   - The result schema, will be used to decode the result of the `execute` function.
 - expectedErrorTags: `PgErrorTag` | `RequestErrorTag`[]
   - error tags that you want explicitly returned from the built function. Others will be wrapped in a `CommonDrizzleError`.
-- transactionMode: `none` | `inherit` | `require`
+- transactionMode: `none` | `inherit` | `require`. Require also makes sure the transaction is rolled back when using 'unique' and you accidentally insert/update multiple rows.
   - `none` -> don't use a transaction
   - `inherit` -> use the transaction of the parent function
   - `require` -> create a new transaction
