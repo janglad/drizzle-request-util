@@ -65,7 +65,7 @@ Options:
 - transactionMode: `none` | `inherit` | `require`. Require also makes sure the transaction is rolled back when using 'unique' and you accidentally insert/update multiple rows.
   - `none` -> don't use a transaction
   - `inherit` (default) -> run in a transaction if called within `withTransaction`, otherwise use regular db client.> 
-  - `require` -> throw an error if the function is not called within `withTransaction. Can be handy in for update/insert/delete combination with `mode: 'unique'` as this'll make the db state gets rolled back if you accidentally touch more than 1 record (unless you handle the error yourself)
+  - `require` -> throw an error if the function is not called within `withTransaction`. Can be handy in for update/insert/delete combination with `mode: 'unique'` as this'll make the db state gets rolled back if you accidentally touch more than 1 record (unless you handle the error yourself)
 - execute: (db, request, decodedRequest) => Promise<Result<ResultSchema, Error>>
   - The function that will be called when the built function is called.
   - Should always return an array (default for core queries in drizzle) so we can validate that the returned result is actually 1 for unique requests.
