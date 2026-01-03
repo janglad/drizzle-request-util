@@ -1,54 +1,19 @@
-import {
-  test,
-  expect,
-  afterAll,
-  it,
-  assert,
-  vi,
-  beforeAll,
-  describe,
-} from "vitest";
-import {
-  PostgreSqlContainer,
-  type StartedPostgreSqlContainer,
-} from "@testcontainers/postgresql";
-import postgres from "postgres";
-import { drizzle } from "drizzle-orm/postgres-js";
-import { eq, sql } from "drizzle-orm";
-import { integer, pgTable } from "drizzle-orm/pg-core";
-import {
-  drizzleRequest,
-  dangerouslySetDbContext,
-  withTransaction,
-  ok,
-  err,
-  onTransactionCommit,
-} from ".";
+import { assert, describe, expect, it, vi } from "vitest";
+
+import { and, between, eq } from "drizzle-orm";
+import { integer, pgTable, text } from "drizzle-orm/pg-core";
 import z from "zod";
-import { beforeEach } from "node:test";
-
-console.log("starting container");
-const container = await new PostgreSqlContainer("postgres:17").start();
-console.log("container started");
-const client = postgres(container.getConnectionUri());
-const _db = drizzle({ client });
-
-beforeAll(async () => {
-  dangerouslySetDbContext({
-    _tag: "db",
-    client: _db,
-  });
-});
-
-afterAll(async () => {
-  await client?.end();
-  console.log("stopping container");
-  await container?.stop();
-  console.log("container stopped");
-});
+import {
+  db,
+  drizzleRequest,
+  err,
+  ok,
+  onTransactionCommit,
+  withTransaction,
+} from ".";
 
 it("Should be live", async () => {
-  const result = (await _db.execute("SELECT 1")) as unknown;
+  const result = (await db.execute("SELECT 1")) as unknown;
   expect(result).toHaveLength(1);
 });
 
@@ -57,11 +22,11 @@ it("Should properly map db errors", async () => {
     id: integer("id").primaryKey(),
   });
 
-  await _db.execute(
+  await db.execute(
     "create table properly_mapped_errors (id integer primary key)"
   );
 
-  await _db.insert(properlyMappedErrors).values({ id: 1 });
+  await db.insert(properlyMappedErrors).values({ id: 1 });
 
   const res = await drizzleRequest("test.properlyMappedErrors", {
     Result: z.object({ id: z.number() }),
@@ -78,6 +43,7 @@ it("Should properly map db errors", async () => {
 it("Should properly map other errors", async () => {
   const res = await drizzleRequest("test.properlyMapOtherErrors", {
     Result: z.object({ id: z.number() }),
+
     mode: "unique",
     execute: () =>
       // @ts-expect-error - test
@@ -90,7 +56,7 @@ it("Should properly map other errors", async () => {
 });
 
 it("Should handle successful many/unique requests", async () => {
-  await _db.execute(
+  await db.execute(
     "create table successful_many_unique_requests (id integer primary key)"
   );
 
@@ -100,8 +66,8 @@ it("Should handle successful many/unique requests", async () => {
       id: integer("id").primaryKey(),
     }
   );
-  await _db.insert(successfulManyUniqueRequests).values({ id: 1 });
-  await _db.insert(successfulManyUniqueRequests).values({ id: 2 });
+  await db.insert(successfulManyUniqueRequests).values({ id: 1 });
+  await db.insert(successfulManyUniqueRequests).values({ id: 2 });
 
   const manyRes = await drizzleRequest(
     "test.successfulManyUniqueRequests.many",
@@ -155,7 +121,7 @@ it("Should handle successful many/unique requests", async () => {
 });
 
 it("Should handle successful transactions", async () => {
-  await _db.execute(
+  await db.execute(
     "create table successful_transactions (id integer primary key)"
   );
 
@@ -180,12 +146,12 @@ it("Should handle successful transactions", async () => {
 
   assert(res.ok === true, "Expected success");
 
-  const count = await _db.$count(successfulTransactions);
+  const count = await db.$count(successfulTransactions);
   expect(count).toBe(2);
 });
 
 it("Should rollback on error in transaction", async () => {
-  await _db.execute("create table rollback_on_error (id integer primary key)");
+  await db.execute("create table rollback_on_error (id integer primary key)");
 
   const rollbackOnError = pgTable("rollback_on_error", {
     id: integer("id").primaryKey(),
@@ -207,7 +173,7 @@ it("Should rollback on error in transaction", async () => {
   assert(errorRes.ok === false, "Expected error");
   expect(errorRes.error.message).toBe("Test error");
 
-  const postErrorCount = await _db.$count(rollbackOnError);
+  const postErrorCount = await db.$count(rollbackOnError);
   expect(postErrorCount).toBe(0);
 
   const defectPromise = withTransaction(async () => {
@@ -218,14 +184,12 @@ it("Should rollback on error in transaction", async () => {
 
   await expect(defectPromise).rejects.toThrow("Test error");
 
-  const postDefectCount = await _db.$count(rollbackOnError);
+  const postDefectCount = await db.$count(rollbackOnError);
   expect(postDefectCount).toBe(0);
 });
 
 it("Should handle nested transactions", async () => {
-  await _db.execute(
-    "create table nested_transactions (id integer primary key)"
-  );
+  await db.execute("create table nested_transactions (id integer primary key)");
 
   const nestedTransactions = pgTable("nested_transactions", {
     id: integer("id").primaryKey(),
@@ -256,7 +220,7 @@ it("Should handle nested transactions", async () => {
 
   assert(res.ok === true, "Expected success");
 
-  const dbState = await _db.select().from(nestedTransactions);
+  const dbState = await db.select().from(nestedTransactions);
 
   expect(dbState).toEqual([{ id: 1 }, { id: 3 }]);
 });
@@ -287,6 +251,69 @@ it("Should decode requests with tuple", async () => {
   });
   await request(1, 2);
   expect(mockExecute).toHaveBeenCalledWith([1, 2]);
+});
+
+describe("prepared", () => {
+  it("something", async () => {
+    const table = pgTable("prepared_test", {
+      id: integer("id").primaryKey(),
+      name: text("name").notNull(),
+      age: integer("age").notNull(),
+    });
+
+    await db.execute(
+      "create table prepared_test (id integer primary key, name text not null, age integer not null)"
+    );
+    await db.insert(table).values({ id: 1, name: "test", age: 1 });
+
+    const request = drizzleRequest("test.prepared", {
+      mode: "many",
+      prepared: true,
+      Request: z.object({
+        id: z.string(),
+        nested: z.object({
+          name: z.string(),
+        }),
+        ageBetween: z.tuple([z.number(), z.number()]),
+      }),
+      Result: z.array(
+        z.object({
+          id: z.number(),
+          name: z.string(),
+          age: z.number(),
+        })
+      ),
+      execute: ($, db, request) => {
+        return db
+          .select()
+          .from(table)
+          .where(
+            and(
+              eq(table.id, $(request.id)),
+              eq(table.name, $(request.nested.name, "aliased_name")),
+              between(
+                table.age,
+                $(request.ageBetween[0]),
+                $(request.ageBetween[1])
+              )
+            )
+          );
+      },
+    });
+    const res = await request({
+      id: "1",
+      nested: { name: "test" },
+      ageBetween: [1, 10],
+    });
+
+    const isPrepared = await db.execute(
+      "select * from pg_prepared_statements "
+    );
+    console.log({ isPrepared });
+
+    assert(res.ok === true, "Expected success");
+    expect(res.value).toEqual([{ id: 1, name: "test", age: 1 }]);
+  });
 });
 
 describe("onTransactionCommit", () => {

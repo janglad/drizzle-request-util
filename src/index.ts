@@ -4,6 +4,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { DrizzleQueryError } from "drizzle-orm/errors";
 import { z } from "zod";
 import type { Cache } from "drizzle-orm/cache/core";
+import { eq, Placeholder, sql } from "drizzle-orm";
+import { toCamelCase, toSnakeCase } from "drizzle-orm/casing";
+import { PostgreSqlContainer } from "@testcontainers/postgresql";
 
 //#region stubs or implementations that should probably live somewhere else in your app
 
@@ -114,15 +117,28 @@ function annotateCurrentSpan() {
 type Prettify<T> = {
   [K in keyof T]: T[K];
 } & {};
+
+type CamelToSnakeCase<S extends string> = S extends `${infer T}${infer U}`
+  ? `${T extends Capitalize<T>
+      ? Lowercase<T> extends Capitalize<T>
+        ? ""
+        : "_"
+      : ""}${Lowercase<T>}${CamelToSnakeCase<U>}`
+  : S;
+
 //#endregion
 
 //#region db client
-// Singleton so we don't create a new client during HMR. TODO: add clean up for old client
+// Implemented this way for testing
 
-// Done as such for easier testing
-export const getDb = () => ({} as Db);
+const container = await new PostgreSqlContainer("postgres:17").start();
 
-export type Db = ReturnType<typeof drizzle>;
+const client = postgres(container.getConnectionUri(), {
+  debug: console.log,
+});
+export const db = drizzle({ client });
+
+export type Db = typeof db;
 export type TransactionClient = Parameters<Parameters<Db["transaction"]>[0]>[0];
 export type CommonClient = Db | TransactionClient;
 
@@ -157,7 +173,7 @@ const getDbClient = (transactionMode: TransactionMode): DbContext => {
   if (transactionMode === "none") {
     return {
       _tag: "db",
-      client: getDb(),
+      client: db,
     };
   }
   const context = dbContext.getStore();
@@ -179,7 +195,7 @@ const getDbClient = (transactionMode: TransactionMode): DbContext => {
   if (context === undefined) {
     return {
       _tag: "db",
-      client: getDb(),
+      client: db,
     };
   }
   return context;
@@ -263,56 +279,272 @@ type RequestSchemaOutput<T extends readonly z.ZodType[] | z.ZodType> =
       }
     : z.output<T>;
 
+type PreparedRequestInput<T extends readonly z.ZodType[] | z.ZodType> =
+  MapKeysToPlaceholder<RequestSchemaInput<T>>;
+
+type MapKeysToPlaceholder<T, Key extends string = ""> = T extends object
+  ? {
+      [K in keyof T]: MapKeysToPlaceholder<
+        T[K],
+        `${Key extends "" ? "" : `${Key}.`}${CamelToSnakeCase<K & string>}`
+      >;
+    } & PlaceHolderWrap<CamelToSnakeCase<Key>, T>
+  : PlaceHolderWrap<CamelToSnakeCase<Key>, T>;
+
+type UnwrapPlaceholderFn = <
+  WrapKey extends string,
+  Value,
+  Key extends string = WrapKey
+>(
+  placeholder: PlaceHolderWrap<WrapKey, Value>,
+  key?: Key
+) => Placeholder<Key, Value>;
+
+const createPlaceholderProxy = (path: string[] = []) =>
+  new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        // allow coercion to string
+        if (prop === Symbol.toPrimitive || prop === "toString") {
+          return () => path.join(".");
+        }
+
+        const key = typeof prop === "string" ? toSnakeCase(prop) : prop;
+
+        return createPlaceholderProxy([...path, String(key)]);
+      },
+    }
+  );
+
+const placeholderWrapSym = Symbol.for("drizzleRequest.placeholderWrap");
+
+interface PlaceHolderWrap<Key extends string, Value> {
+  [placeholderWrapSym]: {
+    key: Key;
+    value: Value;
+  };
+}
+
+interface ExecuteFn<
+  TRequestMode extends RequestMode,
+  RequestSchema extends z.ZodType | readonly z.ZodType[],
+  ResultSchema extends z.ZodType | readonly z.ZodType[]
+> {
+  (
+    db: CommonClient,
+
+    request: RequestSchemaInput<RequestSchema>,
+    decodedRequest: RequestSchemaOutput<RequestSchema>
+  ): Promise<
+    TRequestMode extends "many"
+      ? DrizzleIFy.DrizzleIFy<z.input<ResultSchema>>
+      : readonly DrizzleIFy.DrizzleIFy<z.input<ResultSchema>>[]
+  >;
+}
+interface PreparedExecuteFn<
+  TRequestMode extends RequestMode,
+  RequestSchema extends z.ZodType | readonly z.ZodType[],
+  ResultSchema extends z.ZodType | readonly z.ZodType[]
+> {
+  (
+    $: UnwrapPlaceholderFn,
+    db: CommonClient,
+    request: PreparedRequestInput<RequestSchema>
+  ): Preparable<TRequestMode, ResultSchema>;
+}
+
+interface Preparable<
+  TRequestMode extends RequestMode,
+  ResultSchema extends z.ZodType | readonly z.ZodType[]
+> {
+  prepare(name: string): {
+    execute: (
+      placeholderValues?: Record<string, unknown>
+    ) => Promise<
+      TRequestMode extends "many"
+        ? DrizzleIFy.DrizzleIFy<z.input<ResultSchema>>
+        : readonly DrizzleIFy.DrizzleIFy<z.input<ResultSchema>>[]
+    >;
+  };
+}
+
+interface DrizzleRequest<
+  TRequestMode extends RequestMode,
+  ResultSchema extends TRequestMode extends "void" ? never : z.ZodType,
+  RequestSchema extends z.ZodType | readonly z.ZodType[] = never,
+  ExpectedErrorTags extends readonly (PgErrorTag | RequestErrorTag)[] = []
+> {
+  (
+    ...args: [RequestSchema] extends [never]
+      ? [request?: undefined]
+      : RequestSchema extends readonly z.ZodType[]
+      ? {
+          [K in keyof RequestSchema]: z.output<RequestSchema[K]>;
+        }
+      : [request: z.output<RequestSchema>]
+  ): Promise<
+    Result<
+      TRequestMode extends "void" ? void : z.output<ResultSchema>,
+      | CommonDrizzleError
+      | PgErrorForTag<ExpectedErrorTags[number]>
+      | RequestErrorForTag<ExpectedErrorTags[number]>
+    >
+  >;
+}
+
 export const drizzleRequest = <
   TRequestMode extends RequestMode,
   ResultSchema extends TRequestMode extends "void" ? never : z.ZodType,
   const RequestSchema extends z.ZodType | readonly z.ZodType[] = never,
-  ExpectedErrorTags extends readonly (PgErrorTag | RequestErrorTag)[] = []
+  ExpectedErrorTags extends readonly (PgErrorTag | RequestErrorTag)[] = [],
+  Prepared extends boolean = false
 >(
   id: string,
   options: {
     Result?: ResultSchema;
     Request?: RequestSchema;
     mode: TRequestMode;
+    prepared?: Prepared;
     expectedErrorTags?: ExpectedErrorTags;
-    /**@default "inherit" */
-    transactionMode?: TransactionMode;
-    execute: (
-      db: CommonClient,
-      request: RequestSchemaInput<RequestSchema>,
-      decodedRequest: RequestSchemaOutput<RequestSchema>
-    ) => Promise<
-      TRequestMode extends "many"
-        ? DrizzleIFy.DrizzleIFy<z.input<ResultSchema>>
-        : readonly DrizzleIFy.DrizzleIFy<z.input<ResultSchema>>[]
-    >;
+    /**
+     * @default "inherit" for non prepared requests, "none" for prepared requests.
+     * See `https://github.com/drizzle-team/drizzle-orm/issues/2826`
+     *
+     */
+    transactionMode?: Prepared extends true ? "none" : TransactionMode;
+    execute: Prepared extends true
+      ? PreparedExecuteFn<TRequestMode, RequestSchema, ResultSchema>
+      : ExecuteFn<TRequestMode, RequestSchema, ResultSchema>;
   } & (TRequestMode extends "void"
     ? { Result?: never }
     : { Result: ResultSchema })
-): ((
-  ...args: [RequestSchema] extends [never]
-    ? [request?: undefined]
-    : RequestSchema extends readonly z.ZodType[]
-    ? {
-        [K in keyof RequestSchema]: z.output<RequestSchema[K]>;
-      }
-    : [request: z.output<RequestSchema>]
-) => Promise<
-  Result<
-    TRequestMode extends "void" ? void : z.output<ResultSchema>,
-    | CommonDrizzleError
-    | PgErrorForTag<ExpectedErrorTags[number]>
-    | RequestErrorForTag<ExpectedErrorTags[number]>
-  >
->) => {
+): DrizzleRequest<
+  TRequestMode,
+  ResultSchema,
+  RequestSchema,
+  ExpectedErrorTags
+> => {
   const requestSchema: z.ZodType | undefined = Array.isArray(options.Request)
     ? z.tuple(options.Request as any)
     : (options.Request as z.ZodType | undefined);
 
   const encodeRequest =
     requestSchema === undefined
-      ? () => ok(undefined as never)
+      ? () => ok(undefined as void)
       : encode(requestSchema);
+
+  const execute =
+    options.prepared === true
+      ? (() => {
+          const proxy = createPlaceholderProxy();
+          const aliasMap = new Map<string, string>();
+          const placeholderKeys = new Set<string>();
+
+          const unwrapPlaceholderFn: UnwrapPlaceholderFn = (
+            placeholder,
+            alias
+          ) => {
+            const placeholderKey = String(placeholder);
+            placeholderKeys.add(placeholderKey);
+            if (alias === undefined) {
+              return sql.placeholder(placeholderKey);
+            }
+            aliasMap.set(placeholderKey, alias);
+            return sql.placeholder(alias) as any;
+          };
+
+          const prepared = (
+            options.execute as PreparedExecuteFn<
+              TRequestMode,
+              RequestSchema,
+              ResultSchema
+            >
+          )(
+            unwrapPlaceholderFn,
+            getDbClient("none").client,
+            proxy as any
+          ).prepare(toCamelCase(id));
+
+          const getValueForPlaceholderKey = (
+            key: string,
+            encodedRequest: RequestSchemaInput<RequestSchema>
+          ) => {
+            const segments = key.split(".").map(toCamelCase);
+
+            if (segments.length === 0) {
+              throw new InvariantError({
+                message: `[${id}:getValueForPlaceholderKey] Expected a non empty key, but got an empty string`,
+                cause: key,
+              });
+            }
+
+            let value: any = encodedRequest;
+            for (const segment of segments) {
+              if (typeof value !== "object" || value === null) {
+                console.log({
+                  key,
+                  encodedRequest,
+                  value,
+                  segments,
+                  segment,
+                });
+                throw new InvariantError({
+                  message: `[${id}:getValueForPlaceholderKey] expected a non null object at ${key} but got a ${typeof value}`,
+                  cause: encodedRequest,
+                });
+              }
+              value = value[segment];
+            }
+            return value;
+          };
+
+          return async (encodedRequest: RequestSchemaInput<RequestSchema>) => {
+            annotateCurrentSpan("db.transaction.mode", "none");
+            annotateCurrentSpan("drizzleRequest.prepared", "true");
+
+            console.log({
+              placeholderKeys,
+              aliasMap,
+            });
+
+            const placeholderObject = Object.fromEntries(
+              Array.from(placeholderKeys).map((key) => [
+                aliasMap.get(key) ?? key,
+                getValueForPlaceholderKey(key, encodedRequest),
+              ])
+            );
+
+            try {
+              return ok(await prepared.execute(placeholderObject));
+            } catch (error) {
+              return err(mapExecuteError(error));
+            }
+          };
+        })()
+      : async (
+          encodedRequest: RequestSchemaInput<RequestSchema>,
+          decodedRequest: RequestSchemaOutput<RequestSchema>
+        ) => {
+          try {
+            const context = getDbClient(
+              options.prepared ? "none" : options.transactionMode ?? "inherit"
+            );
+            annotateCurrentSpan("db.transaction.mode", context._tag);
+            annotateCurrentSpan("drizzleRequest.prepared", "false");
+            return ok(
+              await (
+                options.execute as ExecuteFn<
+                  TRequestMode,
+                  RequestSchema,
+                  ResultSchema
+                >
+              )(context.client, encodedRequest as any, decodedRequest)
+            );
+          } catch (e) {
+            return err(mapExecuteError(e));
+          }
+        };
 
   const mapExecuteError = mapDrizzleError(id);
 
@@ -383,21 +615,10 @@ export const drizzleRequest = <
       return err(mapToExpectedError(encodedRequestRes.error));
     }
 
-    const executeRes = await (async () => {
-      try {
-        const context = getDbClient(options.transactionMode ?? "inherit");
-        annotateCurrentSpan("db.transaction.mode", context._tag);
-        return ok(
-          await options.execute(
-            context.client,
-            encodedRequestRes.value as any,
-            decodedRequest
-          )
-        );
-      } catch (e) {
-        return err(mapExecuteError(e));
-      }
-    })();
+    const executeRes = await execute(
+      encodedRequestRes.value as any,
+      decodedRequest
+    );
 
     if (executeRes.ok === false) {
       return err(mapToExpectedError(executeRes.error));
@@ -557,7 +778,7 @@ export const onTransactionCommit =
       currentTransactionContext._tag !== "transaction"
     ) {
       try {
-        await fn(res.value, (...args) => getDb().$cache.invalidate(...args));
+        await fn(res.value, (...args) => db.$cache.invalidate(...args));
       } catch (e) {
         if (env.NODE_ENV === "development") {
           console.warn("[onTransactionCommit] Error in onCommitFinalizer", e);
@@ -567,7 +788,7 @@ export const onTransactionCommit =
     }
     currentTransactionContext.onCommitFinalizers.push(async () => {
       try {
-        await fn(res.value, (...args) => getDb().$cache.invalidate(...args));
+        await fn(res.value, (...args) => db.$cache.invalidate(...args));
       } catch (e) {
         //
         if (env.NODE_ENV === "development") {
