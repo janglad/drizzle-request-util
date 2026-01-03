@@ -472,23 +472,13 @@ export const drizzleRequest = <
           ) => {
             const segments = key.split(".").map(toCamelCase);
 
-            if (segments.length === 0) {
-              throw new InvariantError({
-                message: `[${id}:getValueForPlaceholderKey] Expected a non empty key, but got an empty string`,
-                cause: key,
-              });
+            if (segments[0] === "") {
+              return encodedRequest;
             }
 
             let value: any = encodedRequest;
             for (const segment of segments) {
               if (typeof value !== "object" || value === null) {
-                console.log({
-                  key,
-                  encodedRequest,
-                  value,
-                  segments,
-                  segment,
-                });
                 throw new InvariantError({
                   message: `[${id}:getValueForPlaceholderKey] expected a non null object at ${key} but got a ${typeof value}`,
                   cause: encodedRequest,
@@ -502,11 +492,6 @@ export const drizzleRequest = <
           return async (encodedRequest: RequestSchemaInput<RequestSchema>) => {
             annotateCurrentSpan("db.transaction.mode", "none");
             annotateCurrentSpan("drizzleRequest.prepared", "true");
-
-            console.log({
-              placeholderKeys,
-              aliasMap,
-            });
 
             const placeholderObject = Object.fromEntries(
               Array.from(placeholderKeys).map((key) => [
