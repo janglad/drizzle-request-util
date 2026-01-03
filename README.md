@@ -12,7 +12,7 @@ Similarly the current implementation uses Zod (instead of Standard Schema since 
 
 ### `drizzleRequest`
 
-Build a function that can take in a request and return a result, both encoded/decoded with your provided schema.
+Build a function to make a drizzle request. Will encode inputs and decode outputs, convert Postgres errors to specific JS error objects, validate correct response size, can automatically use transaction client from context if the returned function is called from within one. Supports prepared statements.
 
 ```ts
 const UserId = z.uuid().brand("UserId");
@@ -28,29 +28,55 @@ const getUserById = drizzleRequest("getUserById", {
 
 const user = await getUserById(userId);
 // ^ Result<User, NoSuchElementError | CommonDrizzleError>
-```
-
-```ts
-const UserId = z.uuid().brand("UserId");
-const User = z.object({ ...yourSchema });
 
 const insertUser = drizzleRequest("insertUser", {
-  mode: "unique",
-  transactionMode: "require",
-  Request: UserId,
-  Result: User,
+  //...,
   expectedErrorTags: ["UniqueViolationError"],
   execute: (db, userId) => db.insert(users).values({ id: userId }).returning(),
 });
 
-const res = await insertUser(userId);
+const insertedUser = withTransaction(
+  () =>
+    // Will automatically use the transaction client
+    await insertUser(userId),
+);
 // ^ Result<User, UniqueViolationError | CommonDrizzleError>
+
+// Calls .prepare() under the hood and returns the .execute() function with encoding, decoding, error handling etc
+const preparedGetUser = drizzleRequest("preparedGetUser", {
+  mode: "unique",
+  prepare: true,
+  Request: z.object({
+    id: UserId,
+    ageBetween: z.tuple([z.number(), z.number()]),
+    nested: z.object({
+      name: z.string(),
+    }),
+  }),
+  Result: User,
+  expectedErrorTags: ["NoSuchElementError"],
+  execute: (placeholder, db, request) =>
+    db.query.user.findMany({
+      where: {
+        id: placeHolder(request.userId),
+        // ^ Placeholder<'user_id', string>
+        age: {
+          gt: placeholder(request.ageBetween[0]),
+          //  ^ Placeholder<'age_between.0', number>
+          lt: placeholder(request.ageBetween[1], "aliased_max_age"),
+          //  ^ Placeholder<'aliased_max_age', number>
+        },
+        name: placeHolder(request.nested.name),
+        //     ^ Placeholder<'nested.name', string>
+      },
+    }),
+});
 ```
 
 Options:
 
 - id: string
-  - The id of the request, will be used for tracing and logs.
+  - The id of the request, will be used for tracing and logs. When using `prepare` the id converted to snake case will be used as the prepared statement name.
 - mode: `unique` | `many` | `void`
   - `unique` -> expect a single result, return `NoSuchElementError` if no result is found, return `MultipleElementsFoundError` if multiple results are found
   - `many` -> expect 0 to many results
@@ -62,17 +88,24 @@ Options:
   - The result schema, will be used to decode the result of the `execute` function.
 - expectedErrorTags: `PgErrorTag` | `RequestErrorTag`[]
   - error tags that you want explicitly returned from the built function. Others will be wrapped in a `CommonDrizzleError`.
-- transactionMode: `none` | `inherit` | `require`. Require also makes sure the transaction is rolled back when using 'unique' and you accidentally insert/update multiple rows.
+- prepare: `boolean`
+  - Whether to use drizzle's `.prepare()` or not.
+- transactionMode: `none` | `inherit` | `require`. Require also makes sure the transaction is rolled back when using 'unique' and you accidentally insert/update multiple rows. Always `none` when using `prepared`.
   - `none` -> don't use a transaction
   - `inherit` -> use the transaction of the parent function
   - `require` -> create a new transaction
-- execute: (db, request, decodedRequest) => Promise<Result<ResultSchema, Error>>
+- execute:
   - The function that will be called when the built function is called.
   - Should always return an array (default for core queries in drizzle) so we can validate that the returned result is actually 1 for unique requests.
   - args:
-    - db: db client or transaction client
-    - request: the encoded request
-    - decodedRequest: the decoded request
+    - when `prepare` is false (default)
+      - db: either db client or transaction client
+      - encoded request
+      - decoded request
+    - when `prepare` is true
+      - placeholder: (requestProxy, optional alias override). Will create a `sql.placeHolder` coming from drizzle. Key names are separated by periods and transformed to camelCase. e.g. `placeHolder(user.ageRange[0])` calls `sql.placeHolder('user.age_range.0')` under the hood. These aliases are internally mapped for you when calling the function returned from `drizzleRequest`.
+      - db: db client
+      - encodedPayloadProxy: proxy object with the shape of the encoded payload. To be used with `placeholder()`
 
 ## `withTransaction`
 
@@ -93,7 +126,7 @@ Adds a function that will run after the current transaction has committed. If th
 ```ts
 const insertUser = flow(
   drizzleRequest(/*...*/),
-  onTransactionCommit((userId) => invalidateUserCache(userId))
+  onTransactionCommit((userId) => invalidateUserCache(userId)),
 );
 
 await withTransaction(async () => {
