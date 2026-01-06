@@ -130,7 +130,6 @@ const insertUser = flow(
 );
 
 await withTransaction(async () => {
-  await insertUser(userId);
-  //   ...
+  return await insertUser(userId);
 });
 ```
